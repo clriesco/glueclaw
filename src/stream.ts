@@ -1,19 +1,17 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import {
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  rmSync,
-  renameSync,
-} from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, Usage, TextContent } from "@mariozechner/pi-ai";
 import { deriveTurnSessionKey } from "./session-key.js";
+import {
+  acquireOpenClawLoopback,
+  describeLoopbackError,
+  writeMcpConfig,
+} from "./openclaw-loopback.js";
 
 const PROCESS_TIMEOUT_MS = 5000;
 const REQUEST_TIMEOUT_MS = 120_000;
@@ -92,110 +90,6 @@ export function buildMsg(
   };
 }
 
-interface McpLoopbackRuntime {
-  port: number;
-  ownerToken: string;
-  nonOwnerToken?: string;
-}
-
-let _mcpLoopback: { port: number; token: string } | undefined;
-let _mcpBootstrapAttempted = false;
-
-/** Bootstrap OpenClaw's MCP loopback server in-process and return the
- *  port + owner token. GlueClaw runs inside the gateway process, so we
- *  share OpenClaw's module cache: importing the same `mcp-http-*.js`
- *  the gateway loaded gives us the singleton, and a no-op when another
- *  caller already started it.
- *
- *  Returns undefined if the OpenClaw dist cannot be located or its API
- *  has changed — in that case the claude subprocess simply runs without
- *  session tools, matching pre-RFC-001 behavior. */
-export async function getMcpLoopback(): Promise<
-  { port: number; token: string } | undefined
-> {
-  if (_mcpLoopback) return _mcpLoopback;
-  if (_mcpBootstrapAttempted) return undefined;
-  _mcpBootstrapAttempted = true;
-
-  try {
-    const { readdir } = await import("node:fs/promises");
-    const nodePaths = (process.env.NODE_PATH ?? "").split(":");
-    const distDirs = nodePaths
-      .filter((p) => p.includes("openclaw"))
-      .map((p) => p.replace(/\/node_modules\/?$/, "/dist"));
-
-    for (const distDir of distDirs) {
-      try {
-        const files = await readdir(distDir);
-        const mcpFile = files.find(
-          (f) => f.startsWith("mcp-http-") && f.endsWith(".js"),
-        );
-        if (!mcpFile) continue;
-        const mod = (await import(
-          `file://${distDir}/${mcpFile}`
-        )) as Record<string, unknown>;
-        // Minified aliases: n=ensureMcpLoopbackServer, i=getActiveMcpLoopbackRuntime
-        const ensureFn = (mod["n"] ?? mod["ensureMcpLoopbackServer"]) as
-          | (() => Promise<unknown>)
-          | undefined;
-        const getRuntime = (mod["i"] ?? mod["getActiveMcpLoopbackRuntime"]) as
-          | (() => McpLoopbackRuntime | undefined)
-          | undefined;
-        if (typeof ensureFn !== "function" || typeof getRuntime !== "function") {
-          continue;
-        }
-        await ensureFn();
-        const runtime = getRuntime();
-        if (runtime?.port && runtime.ownerToken) {
-          _mcpLoopback = { port: runtime.port, token: runtime.ownerToken };
-          return _mcpLoopback;
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    // Non-fatal: session tools simply won't be available
-  }
-  return undefined;
-}
-
-/** Write a temporary MCP config file for the claude subprocess. */
-export function writeMcpConfig(port: number): {
-  path: string;
-  cleanup: () => void;
-} {
-  const dir = join(tmpdir(), `glueclaw-mcp-${randomBytes(8).toString("hex")}`);
-  mkdirSync(dir, { recursive: true });
-  const configPath = join(dir, "mcp.json");
-  const config = {
-    mcpServers: {
-      openclaw: {
-        type: "http",
-        url: `http://127.0.0.1:${port}/mcp`,
-        headers: {
-          Authorization: "Bearer ${OPENCLAW_MCP_TOKEN}",
-          "x-session-key": "${OPENCLAW_MCP_SESSION_KEY}",
-          "x-openclaw-agent-id": "${OPENCLAW_MCP_AGENT_ID}",
-          "x-openclaw-account-id": "${OPENCLAW_MCP_ACCOUNT_ID}",
-          "x-openclaw-message-channel": "${OPENCLAW_MCP_MESSAGE_CHANNEL}",
-        },
-      },
-    },
-  };
-  writeFileSync(configPath, JSON.stringify(config, null, 2));
-  return {
-    path: configPath,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true });
-      } catch {
-        // Temp dir cleanup is best-effort
-      }
-    },
-  };
-}
-
 /** Scrub Anthropic detection triggers from system prompts. */
 export function scrubPrompt(input: string): string {
   return input
@@ -253,6 +147,17 @@ export function createClaudeCliStreamFn(opts: {
         });
         const effectiveSessionKey =
           turnSessionKey ?? opts.sessionKey ?? "default";
+        // [GC-DBG] temporary diagnostics — remove once stamping is reconfirmed end-to-end.
+        const _dbgIncomingRequester =
+          (context.systemPrompt ?? "").match(
+            /Agent 1 \(requester\) session:\s*([^\s.]+)/,
+          )?.[1] ?? "(none)";
+        const _dbgHasA2A = /Agent-to-agent message context/.test(
+          context.systemPrompt ?? "",
+        );
+        process.stderr.write(
+          `[GC-DBG] agent=${opts.agentId ?? "(none)"} effectiveSessionKey=${effectiveSessionKey} derivedFrom=${turnSessionKey ? "derived" : "fallback"} incomingRequester=${_dbgIncomingRequester} hasA2ABlock=${_dbgHasA2A}\n`,
+        );
         // Scrub Anthropic detection triggers (see docs/detection-patterns.md)
         const cleanPrompt = scrubPrompt(context.systemPrompt ?? "");
         const resolvedModel = opts.modelOverride ?? model.id;
@@ -299,16 +204,23 @@ export function createClaudeCliStreamFn(opts: {
         delete env.ANTHROPIC_API_KEY_OLD;
 
         // Wire up MCP bridge for OpenClaw gateway tools
-        const loopback = await getMcpLoopback();
-        if (loopback) {
-          const mcp = writeMcpConfig(loopback.port);
+        const loopback = await acquireOpenClawLoopback();
+        if (loopback.ok) {
+          process.stderr.write(
+            `[GC-DBG] mcpLoopback=port=${loopback.handle.port} via=${loopback.source}\n`,
+          );
+          const mcp = writeMcpConfig(loopback.handle.port);
           mcpCleanup = mcp.cleanup;
           args.push("--strict-mcp-config", "--mcp-config", mcp.path);
-          env.OPENCLAW_MCP_TOKEN = loopback.token;
+          env.OPENCLAW_MCP_TOKEN = loopback.handle.token;
           env.OPENCLAW_MCP_SESSION_KEY = effectiveSessionKey;
           env.OPENCLAW_MCP_AGENT_ID = opts.agentId ?? "main";
           env.OPENCLAW_MCP_ACCOUNT_ID = "";
           env.OPENCLAW_MCP_MESSAGE_CHANNEL = "";
+        } else {
+          process.stderr.write(
+            `[GC-DBG] mcpLoopback=UNAVAILABLE reason=${describeLoopbackError(loopback.error)}\n`,
+          );
         }
 
         // Use persistent dir so claude sessions survive restarts

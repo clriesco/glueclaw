@@ -4,8 +4,11 @@ import {
   buildMsg,
   scrubPrompt,
   unscrubResponse,
-  getMcpLoopback,
 } from "../../stream.js";
+import {
+  acquireOpenClawLoopback,
+  resetOpenClawLoopbackCache,
+} from "../../openclaw-loopback.js";
 import { MODEL_CATALOG } from "../../catalog.js";
 import { binarySearchTrigger } from "../../healthcheck.js";
 import { resolveSessionKey } from "../../session-key.js";
@@ -204,48 +207,71 @@ describe("unscrubResponse", () => {
   });
 });
 
-describe("getMcpLoopback", () => {
+describe("acquireOpenClawLoopback (env fast path)", () => {
   const origPort = process.env.__GLUECLAW_MCP_PORT;
   const origToken = process.env.__GLUECLAW_MCP_TOKEN;
+  const origDist = process.env.OPENCLAW_DIST_DIR;
+  const origNodePath = process.env.NODE_PATH;
 
   afterEach(() => {
+    resetOpenClawLoopbackCache();
     if (origPort !== undefined) process.env.__GLUECLAW_MCP_PORT = origPort;
     else delete process.env.__GLUECLAW_MCP_PORT;
     if (origToken !== undefined) process.env.__GLUECLAW_MCP_TOKEN = origToken;
     else delete process.env.__GLUECLAW_MCP_TOKEN;
+    if (origDist !== undefined) process.env.OPENCLAW_DIST_DIR = origDist;
+    else delete process.env.OPENCLAW_DIST_DIR;
+    if (origNodePath !== undefined) process.env.NODE_PATH = origNodePath;
+    else delete process.env.NODE_PATH;
   });
 
-  it("returns { port, token } when both env vars set", () => {
+  it("returns handle from env vars when both are set", async () => {
     process.env.__GLUECLAW_MCP_PORT = "3456";
     process.env.__GLUECLAW_MCP_TOKEN = "secret123";
-    const result = getMcpLoopback();
-    expect(result).toEqual({ port: 3456, token: "secret123" });
+    const result = await acquireOpenClawLoopback();
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.source).toBe("env");
+      expect(result.handle).toEqual({ port: 3456, token: "secret123" });
+    }
   });
 
-  it("returns undefined when port is missing", () => {
+  it("ignores env when port is missing", async () => {
     delete process.env.__GLUECLAW_MCP_PORT;
     process.env.__GLUECLAW_MCP_TOKEN = "secret123";
-    expect(getMcpLoopback()).toBeUndefined();
+    delete process.env.OPENCLAW_DIST_DIR;
+    process.env.NODE_PATH = "";
+    const result = await acquireOpenClawLoopback();
+    if (result.ok) expect(result.source).not.toBe("env");
   });
 
-  it("returns undefined when token is missing", () => {
+  it("ignores env when token is missing", async () => {
     process.env.__GLUECLAW_MCP_PORT = "3456";
     delete process.env.__GLUECLAW_MCP_TOKEN;
-    expect(getMcpLoopback()).toBeUndefined();
+    delete process.env.OPENCLAW_DIST_DIR;
+    process.env.NODE_PATH = "";
+    const result = await acquireOpenClawLoopback();
+    if (result.ok) expect(result.source).not.toBe("env");
   });
 
-  it("returns undefined when both are missing", () => {
-    delete process.env.__GLUECLAW_MCP_PORT;
-    delete process.env.__GLUECLAW_MCP_TOKEN;
-    expect(getMcpLoopback()).toBeUndefined();
+  it("rejects non-numeric port from env", async () => {
+    process.env.__GLUECLAW_MCP_PORT = "not-a-port";
+    process.env.__GLUECLAW_MCP_TOKEN = "secret";
+    delete process.env.OPENCLAW_DIST_DIR;
+    process.env.NODE_PATH = "";
+    const result = await acquireOpenClawLoopback();
+    if (result.ok) expect(result.source).not.toBe("env");
   });
 
-  it("parses port as integer", () => {
+  it("parses port as integer from env", async () => {
     process.env.__GLUECLAW_MCP_PORT = "8080";
     process.env.__GLUECLAW_MCP_TOKEN = "tok";
-    const result = getMcpLoopback();
-    expect(result?.port).toBe(8080);
-    expect(typeof result?.port).toBe("number");
+    const result = await acquireOpenClawLoopback();
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.handle.port).toBe(8080);
+      expect(typeof result.handle.port).toBe("number");
+    }
   });
 });
 

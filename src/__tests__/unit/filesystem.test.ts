@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
-import { writeMcpConfig } from "../../stream.js";
+import { writeMcpConfig } from "../../openclaw-loopback.js";
 
 describe("writeMcpConfig", () => {
   let cleanup: (() => void) | undefined;
