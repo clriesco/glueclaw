@@ -2,8 +2,14 @@
   "id": "glueclaw",
   "enabledByDefault": false,
   "providers": ["glueclaw"],
-  "providerAuthEnvVars": {
-    "glueclaw": ["GLUECLAW_KEY"]
+  "setup": {
+    "providers": [
+      {
+        "id": "glueclaw",
+        "authMethods": ["local"],
+        "envVars": ["GLUECLAW_KEY"]
+      }
+    ]
   },
   "providerAuthChoices": [
     {
