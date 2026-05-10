@@ -36,10 +36,25 @@ export function resolveSessionKey(ctx: {
  * `streamFn(model, context, options)` call, so we recover it from
  * artifacts the gateway *does* leave in the prompt:
  *
- *   - **Inter-agent inbound:** the system prompt is extended with an
- *     `Agent-to-agent message context` block whose
+ *   - **Inter-agent inbound (legacy spawn):** the system prompt is
+ *     extended with an `Agent-to-agent message context` block whose
  *     `Agent 2 (target) session: agent:<id>:<chan>:…` line is literally
  *     this turn's session key. Use it verbatim.
+ *
+ *   - **agent-link inbound:** one of the trailing user messages starts
+ *     with a header `[agent-link · from=<peer> · msgId=… · thread=<id>↔<peer>]`
+ *     deterministically prepended by the agent-link plugin's runtime
+ *     bridge (see agent-link `src/runtime-bridge.ts:buildBodyForAgent`).
+ *     OpenClaw 2026.5.6+ may follow that body with one or more extra
+ *     user messages (e.g. a `Conversation info` metadata block), so we
+ *     scan every trailing user message — not just the last one — for
+ *     the header. The peer in `from=` plus this agent's id reconstruct
+ *     the canonical session key `agent:<agentId>:agent-link:direct:<peer>`.
+ *     Without this branch the turn falls through to `agentDir`, sharing
+ *     the agent's general-purpose Claude session and `--resume`-ing a
+ *     polluted transcript (heartbeats, other channels) — Claude then
+ *     replies with stale patterns instead of treating the agent-link
+ *     message on its own merits.
  *
  *   - **Channel inbound (Telegram):** the most recent user message
  *     starts with a `Conversation info` JSON block carrying
@@ -70,11 +85,25 @@ export function deriveTurnSessionKey(params: {
   );
   if (targetMatch) return targetMatch[1];
 
-  const lastUserText = extractLastUserText(params.messages);
-  if (lastUserText) {
-    const chatMatch = lastUserText.match(
-      /"chat_id"\s*:\s*"([a-z]+):(-?\d+)"/i,
+  // OpenClaw 2026.5.6+ may split a turn into multiple consecutive user
+  // messages (the actual body, plus a `Conversation info` metadata block).
+  // We scan every trailing user message for the agent-link header before
+  // falling through to the chat_id-based Telegram match. The Telegram
+  // chat_id JSON typically lives in the trailing metadata block, while the
+  // agent-link header sits at the start of the body block — so we look at
+  // both sides instead of just the last message.
+  const trailingTexts = extractTrailingUserTexts(params.messages);
+  for (const text of trailingTexts) {
+    const agentLinkMatch = text.match(
+      /^\[agent-link\b[^\]]*\bfrom=([A-Za-z0-9_-]+)/,
     );
+    if (agentLinkMatch) {
+      return `agent:${agentId}:agent-link:direct:${agentLinkMatch[1]}`;
+    }
+  }
+
+  for (const text of trailingTexts) {
+    const chatMatch = text.match(/"chat_id"\s*:\s*"([a-z]+):(-?\d+)"/i);
     if (chatMatch) {
       const channel = chatMatch[1].toLowerCase();
       const rawId = chatMatch[2];
@@ -90,6 +119,24 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function extractUserTextFromContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content || undefined;
+  if (Array.isArray(content)) {
+    const txt = content
+      .filter(
+        (b: unknown): b is { type: string; text: string } =>
+          typeof b === "object" &&
+          b !== null &&
+          (b as { type?: unknown }).type === "text" &&
+          typeof (b as { text?: unknown }).text === "string",
+      )
+      .map((b) => b.text)
+      .join("\n");
+    return txt || undefined;
+  }
+  return undefined;
+}
+
 function extractLastUserText(
   messages: Array<{ role: string; content: unknown }> | undefined,
 ): string | undefined {
@@ -97,23 +144,33 @@ function extractLastUserText(
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.role !== "user") continue;
-    const c = m.content;
-    if (typeof c === "string") return c;
-    if (Array.isArray(c)) {
-      const txt = c
-        .filter(
-          (b: unknown): b is { type: string; text: string } =>
-            typeof b === "object" &&
-            b !== null &&
-            (b as { type?: unknown }).type === "text" &&
-            typeof (b as { text?: unknown }).text === "string",
-        )
-        .map((b) => b.text)
-        .join("\n");
-      if (txt) return txt;
-    }
+    const txt = extractUserTextFromContent(m.content);
+    if (txt) return txt;
   }
   return undefined;
+}
+
+/**
+ * Collect the text of every user message in the trailing run of consecutive
+ * user-role messages, ordered oldest-to-newest. OpenClaw 2026.5.6+ may
+ * split a single turn into multiple user messages (e.g. the inbound body
+ * plus a `Conversation info` metadata block). Both the agent-link header
+ * (in the body) and the Telegram `chat_id` JSON (in the metadata) need to
+ * be discoverable, so we expose every trailing user-message text rather
+ * than just the last one.
+ */
+function extractTrailingUserTexts(
+  messages: Array<{ role: string; content: unknown }> | undefined,
+): string[] {
+  if (!messages) return [];
+  const trailing: string[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "user") break;
+    const txt = extractUserTextFromContent(m.content);
+    if (txt) trailing.unshift(txt);
+  }
+  return trailing;
 }
 
 function classifyChatId(raw: string): { kind: string; id: string } {

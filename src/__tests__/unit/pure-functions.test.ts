@@ -11,7 +11,7 @@ import {
 } from "../../openclaw-loopback.js";
 import { MODEL_CATALOG } from "../../catalog.js";
 import { binarySearchTrigger } from "../../healthcheck.js";
-import { resolveSessionKey } from "../../session-key.js";
+import { deriveTurnSessionKey, resolveSessionKey } from "../../session-key.js";
 
 describe("buildUsage", () => {
   it("returns zeroed usage when called with undefined", () => {
@@ -449,5 +449,141 @@ describe("resolveSessionKey", () => {
         sessionId: "would-be-skipped",
       }),
     ).toBe("would-be-skipped");
+  });
+});
+
+describe("deriveTurnSessionKey", () => {
+  function userMsg(text: string) {
+    return { role: "user" as const, content: [{ type: "text", text }] };
+  }
+
+  it("returns undefined when agentId is missing", () => {
+    expect(
+      deriveTurnSessionKey({
+        messages: [userMsg("[agent-link · from=waka · msgId=al-1 · thread=chiki↔waka]")],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined when no recognised signal is present", () => {
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        systemPrompt: "Generic prompt with no agent-link / chat_id / spawn block.",
+        messages: [userMsg("just a plain message body")],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("derives an agent-link session key from the inbound header", () => {
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        messages: [
+          userMsg(
+            "[agent-link · from=waka · msgId=al-mozg9sv1-7420ds7p · thread=chiki↔waka]\n\n{\"tipo\":\"factura_ingesta\"}",
+          ),
+        ],
+      }),
+    ).toBe("agent:chiki:agent-link:direct:waka");
+  });
+
+  it("finds the agent-link header even when followed by a metadata user message (OpenClaw 2026.5.6+)", () => {
+    // OpenClaw 2026.5.6+ splits a turn into the inbound body plus a
+    // trailing `Conversation info` metadata block, both as role=user.
+    // The agent-link header lives in the body (older) message; the
+    // metadata block is the most recent user message. The function must
+    // scan every trailing user message, not only the last one.
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        messages: [
+          userMsg(
+            "[agent-link · from=waka · msgId=al-mozpvwkf-96rssgx7 · thread=chiki↔waka]\n\nbody payload",
+          ),
+          userMsg(
+            'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "waka",\n  "message_id": "al-mozpvwkf-96rssgx7",\n  "sender_id": "waka"\n}\n```',
+          ),
+        ],
+      }),
+    ).toBe("agent:chiki:agent-link:direct:waka");
+  });
+
+  it("derives the agent-link key when the header carries in_reply_to", () => {
+    // Replies from the peer keep the same `from=<peer>` token, so the
+    // session key must stay stable across turns of the same conversation.
+    expect(
+      deriveTurnSessionKey({
+        agentId: "roy",
+        messages: [
+          userMsg(
+            "[agent-link · from=evacastro · msgId=al-mozihea8-zwmp8391 · in_reply_to=al-mozigw7y-g5zq5b2d · thread=roy↔evacastro]\n↪ Tu envío anterior (msgId al-…, hace 23s):\n> texto\n\nACK-DIAG-EVA",
+          ),
+        ],
+      }),
+    ).toBe("agent:roy:agent-link:direct:evacastro");
+  });
+
+  it("does not falsely match a Telegram payload that mentions agent-link in body", () => {
+    // The agent-link branch is anchored to start-of-text; a Telegram
+    // message that quotes "agent-link" mid-body must not divert to the
+    // wrong key. The chat_id branch should still pick this up.
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        messages: [
+          userMsg(
+            'Hi, I read about [agent-link · from=...] in the docs.\n```json\n{"chat_id": "telegram:540382330"}\n```',
+          ),
+        ],
+      }),
+    ).toBe("agent:chiki:telegram:direct:540382330");
+  });
+
+  it("derives a Telegram direct chat key from chat_id JSON (regression)", () => {
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        messages: [
+          userMsg('```json\n{"chat_id": "telegram:8426343632"}\n```'),
+        ],
+      }),
+    ).toBe("agent:chiki:telegram:direct:8426343632");
+  });
+
+  it("derives a Telegram supergroup key from a -100… chat_id (regression)", () => {
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        messages: [
+          userMsg('```json\n{"chat_id": "telegram:-1005229099225"}\n```'),
+        ],
+      }),
+    ).toBe("agent:chiki:telegram:supergroup:5229099225");
+  });
+
+  it("derives the legacy spawn key from `Agent 2 (target) session:` (regression)", () => {
+    expect(
+      deriveTurnSessionKey({
+        agentId: "evacastro",
+        systemPrompt:
+          "Agent-to-agent message context\nAgent 1 (requester) session: agent:roy:main\nAgent 2 (target) session: agent:evacastro:main",
+      }),
+    ).toBe("agent:evacastro:main");
+  });
+
+  it("prefers the legacy spawn key over the agent-link header when both are present", () => {
+    // Defence in depth: if a future pipeline somehow surfaces both
+    // signals at once, the explicit `Agent 2 (target) session:` line is
+    // authoritative because it is constructed by the gateway, not by a
+    // plugin's user-facing prompt.
+    expect(
+      deriveTurnSessionKey({
+        agentId: "chiki",
+        systemPrompt:
+          "Agent 2 (target) session: agent:chiki:custom:scope",
+        messages: [userMsg("[agent-link · from=waka · msgId=al-1 · thread=chiki↔waka]")],
+      }),
+    ).toBe("agent:chiki:custom:scope");
   });
 });
