@@ -182,21 +182,29 @@ export function createClaudeCliStreamFn(opts: {
         if (cleanPrompt) args.push("--system-prompt", cleanPrompt);
         if (resolvedModel) args.push("--model", resolvedModel);
 
-        // Debug: log args for resume troubleshooting
-        // Extract user message and scrub it too
-        const lastUser = [...(context.messages ?? [])]
-          .reverse()
-          .find((m) => m.role === "user");
-        let prompt = "";
-        if (lastUser) {
-          const c = lastUser.content;
-          if (typeof c === "string") prompt = c;
-          else if (Array.isArray(c))
-            prompt = c
-              .filter((b): b is TextContent => b.type === "text")
+        // OpenClaw 2026.5.6+ may split a turn into multiple consecutive user
+        // messages (e.g. the actual text plus a metadata block). Concatenate
+        // every trailing user message so nothing the user said is dropped.
+        const messages = context.messages ?? [];
+        const trailingUsers: typeof messages = [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i];
+          if (!m || m.role !== "user") break;
+          trailingUsers.unshift(m);
+        }
+        const extractText = (c: unknown): string => {
+          if (typeof c === "string") return c;
+          if (Array.isArray(c))
+            return c
+              .filter((b): b is TextContent => b?.type === "text")
               .map((b) => b.text)
               .join("\n");
-        }
+          return "";
+        };
+        const prompt = trailingUsers
+          .map((m) => extractText(m.content))
+          .filter((t) => t.length > 0)
+          .join("\n\n");
         if (prompt) args.push(prompt);
 
         const env = { ...process.env };
