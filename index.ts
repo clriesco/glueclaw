@@ -52,6 +52,7 @@ export default definePluginEntry({
       envVars: ["GLUECLAW_KEY"],
       auth: [
         {
+          id: "local",
           method: "local",
           label: "Local Claude CLI",
           hint: "Uses your locally installed claude binary",
