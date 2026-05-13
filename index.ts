@@ -111,12 +111,19 @@ export default definePluginEntry({
       augmentModelCatalog: () => [...MODEL_CATALOG],
     });
 
-    // Subscribe to session_end: when openclaw resets a session (reason="reset"
-    // or "new") or deletes it ("deleted"), flush our in-memory mapping and
-    // archive the underlying claude CLI transcript. Other reasons (idle,
-    // daily, compaction) are normal lifecycle rotations where we want to keep
-    // the claude session alive across them.
-    const FLUSH_REASONS = new Set(["reset", "new", "deleted"]);
+    // Subscribe to session_end: flush our mapping and archive the claude CLI
+    // transcript when openclaw rotates the session. We act on:
+    //   - reset    : explicit /reset or sessions.reset RPC
+    //   - new      : same as reset (different surface label)
+    //   - deleted  : session.delete RPC
+    //   - daily    : session.resetByChannel daily policy fired at atHour
+    // We do NOT flush on:
+    //   - idle    : not currently used (kept conservative — would break mid-
+    //               batch agent-link bursts)
+    //   - compaction : openclaw trimmed history in place, claude CLI session
+    //               unchanged — flushing would lose context for no reason
+    //   - unknown : defensive — leave glueclaw state alone
+    const FLUSH_REASONS = new Set(["reset", "new", "deleted", "daily"]);
     api.on?.("session_end", (event) => {
       if (!event.sessionKey) return;
       if (!event.reason || !FLUSH_REASONS.has(event.reason)) return;
