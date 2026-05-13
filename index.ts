@@ -3,7 +3,12 @@ import {
   definePluginEntry,
   type OpenClawPluginApi,
 } from "openclaw/plugin-sdk/plugin-entry";
-import { createClaudeCliStreamFn } from "./src/stream.js";
+import {
+  createClaudeCliStreamFn,
+  listSessions,
+  dropSession,
+  flushSession,
+} from "./src/stream.js";
 import { MODEL_CATALOG } from "./src/catalog.js";
 import { resolveSessionKey } from "./src/session-key.js";
 
@@ -104,5 +109,88 @@ export default definePluginEntry({
       }),
       augmentModelCatalog: () => [...MODEL_CATALOG],
     });
+
+    // Subscribe to session_end: when openclaw resets a session (reason="reset"
+    // or "new") or deletes it ("deleted"), flush our in-memory mapping and
+    // archive the underlying claude CLI transcript. Other reasons (idle,
+    // daily, compaction) are normal lifecycle rotations where we want to keep
+    // the claude session alive across them.
+    const FLUSH_REASONS = new Set(["reset", "new", "deleted"]);
+    api.on?.("session_end", (event) => {
+      if (!event.sessionKey) return;
+      if (!event.reason || !FLUSH_REASONS.has(event.reason)) return;
+      const result = flushSession(event.sessionKey);
+      if (result.droppedKey || result.archivedPath) {
+        process.stderr.write(
+          `[GC-RESET] session_end reason=${event.reason} key=${event.sessionKey} dropped=${result.droppedKey} archived=${result.archivedPath ?? "(none)"}\n`,
+        );
+      }
+    });
+
+    // RPC surface for manual ops (skills, crons, debug). Operator scope by
+    // default — only the gateway's authenticated operator can call these.
+    api.registerGatewayMethod?.(
+      "glueclaw.listSessions",
+      async (opts) => {
+        const o = opts as unknown as {
+          respond: (
+            ok: boolean,
+            payload?: unknown,
+            error?: { code?: string; message?: string },
+          ) => void;
+        };
+        o.respond(true, { sessions: listSessions() });
+      },
+    );
+
+    api.registerGatewayMethod?.(
+      "glueclaw.dropSession",
+      async (opts) => {
+        const o = opts as unknown as {
+          params?: Record<string, unknown>;
+          respond: (
+            ok: boolean,
+            payload?: unknown,
+            error?: { code?: string; message?: string },
+          ) => void;
+        };
+        const sessionKey = (o.params?.sessionKey ?? o.params?.key) as
+          | string
+          | undefined;
+        if (!sessionKey) {
+          o.respond(false, undefined, {
+            code: "invalid-params",
+            message: "glueclaw.dropSession: sessionKey is required",
+          });
+          return;
+        }
+        o.respond(true, { dropped: dropSession(sessionKey) });
+      },
+    );
+
+    api.registerGatewayMethod?.(
+      "glueclaw.flushSession",
+      async (opts) => {
+        const o = opts as unknown as {
+          params?: Record<string, unknown>;
+          respond: (
+            ok: boolean,
+            payload?: unknown,
+            error?: { code?: string; message?: string },
+          ) => void;
+        };
+        const sessionKey = (o.params?.sessionKey ?? o.params?.key) as
+          | string
+          | undefined;
+        if (!sessionKey) {
+          o.respond(false, undefined, {
+            code: "invalid-params",
+            message: "glueclaw.flushSession: sessionKey is required",
+          });
+          return;
+        }
+        o.respond(true, flushSession(sessionKey));
+      },
+    );
   },
 });

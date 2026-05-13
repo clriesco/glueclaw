@@ -1,6 +1,13 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+  existsSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
@@ -16,6 +23,15 @@ import {
 const PROCESS_TIMEOUT_MS = 5000;
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_SESSIONS = 1000;
+
+/** Max size for a claude session JSONL before the resume watchdog archives it.
+ *  Override with GLUECLAW_MAX_JSONL_MB (positive number, MB). Default 5 MB. */
+const MAX_RESUME_BYTES = (() => {
+  const raw = process.env.GLUECLAW_MAX_JSONL_MB;
+  const parsed = raw === undefined || raw === "" ? 5 : Number(raw);
+  const mb = Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+  return mb * 1024 * 1024;
+})();
 
 /** Shape of NDJSON stream events from the Claude CLI. */
 interface StreamEventData {
@@ -56,6 +72,73 @@ export function persistSessions(): void {
   } catch {
     // Best-effort persistence — non-fatal if disk write fails
   }
+}
+
+/** Slugify a directory path the way the claude CLI names per-project session dirs.
+ *  Example: '/home/pacolobo/.glueclaw' -> '-home-pacolobo--glueclaw'. */
+function claudeProjectSlug(cwd: string): string {
+  return "-" + cwd.replace(/^\/+/, "").replace(/[\/.]/g, "-");
+}
+
+const CLAUDE_PROJECT_DIR = join(
+  process.env.HOME ?? tmpdir(),
+  ".claude",
+  "projects",
+  claudeProjectSlug(GC_HOME),
+);
+
+/** Resolve the on-disk claude CLI session transcript for a given session UUID. */
+export function claudeSessionJsonlPath(sessionId: string): string {
+  return join(CLAUDE_PROJECT_DIR, `${sessionId}.jsonl`);
+}
+
+/** Normalize a sessionKey: glueclaw stores keys with the 'glueclaw:' prefix. */
+function normalizeSessionKey(key: string): string {
+  return key.startsWith("glueclaw:") ? key : `glueclaw:${key}`;
+}
+
+/** Snapshot of the in-memory session map. For inspection / health endpoints. */
+export function listSessions(): Record<string, string> {
+  return Object.fromEntries(sessionMap);
+}
+
+/** Remove the in-memory mapping for a session key and persist the change.
+ *  Does NOT touch the underlying claude CLI transcript. Use flushSession for that. */
+export function dropSession(sessionKey: string): boolean {
+  const key = normalizeSessionKey(sessionKey);
+  const had = sessionMap.has(key);
+  if (had) {
+    sessionMap.delete(key);
+    persistSessions();
+  }
+  return had;
+}
+
+/** Drop the mapping AND archive the underlying claude CLI transcript so the
+ *  next turn for this key starts a fresh session UUID. Idempotent. */
+export function flushSession(sessionKey: string): {
+  droppedKey: boolean;
+  archivedPath: string | null;
+  uuid: string | null;
+} {
+  const key = normalizeSessionKey(sessionKey);
+  const uuid = sessionMap.get(key) ?? null;
+  let archivedPath: string | null = null;
+  if (uuid) {
+    const jsonl = claudeSessionJsonlPath(uuid);
+    if (existsSync(jsonl)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const dest = `${jsonl}.archived.${ts}`;
+      try {
+        renameSync(jsonl, dest);
+        archivedPath = dest;
+      } catch {
+        // Best-effort — proceed with dropping the in-memory mapping anyway.
+      }
+    }
+  }
+  const droppedKey = dropSession(key);
+  return { droppedKey, archivedPath, uuid };
 }
 
 export function buildUsage(raw?: Record<string, number>): Usage {
@@ -177,7 +260,31 @@ export function createClaudeCliStreamFn(opts: {
         const sessionKey = `glueclaw:${effectiveSessionKey}`;
         const existingSessionId = sessionMap.get(sessionKey);
         if (existingSessionId) {
-          args.push("--resume", existingSessionId);
+          // Resume watchdog: skip --resume (and force a fresh session) when the
+          // transcript is either bloated past MAX_RESUME_BYTES (prefill races
+          // the LLM idle timeout) or missing entirely (phantom mapping from a
+          // prior failed turn — --resume to a non-existent file produces
+          // "(no response)" with 0 tokens).
+          const jsonl = claudeSessionJsonlPath(existingSessionId);
+          let size = -1;
+          try {
+            size = statSync(jsonl).size;
+          } catch {
+            size = -1; // missing
+          }
+          if (size < 0) {
+            process.stderr.write(
+              `[GC-WATCHDOG] phantom mapping (jsonl missing) key=${sessionKey} uuid=${existingSessionId} — dropping mapping, starting fresh\n`,
+            );
+            dropSession(sessionKey);
+          } else if (size > MAX_RESUME_BYTES) {
+            process.stderr.write(
+              `[GC-WATCHDOG] bloated transcript key=${sessionKey} uuid=${existingSessionId} size=${size} max=${MAX_RESUME_BYTES} — archiving, starting fresh\n`,
+            );
+            flushSession(sessionKey);
+          } else {
+            args.push("--resume", existingSessionId);
+          }
         }
         if (cleanPrompt) args.push("--system-prompt", cleanPrompt);
         if (resolvedModel) args.push("--model", resolvedModel);
